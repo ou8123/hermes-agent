@@ -730,6 +730,23 @@ async def _handle_runs(
                     room_dispatch=room_dispatch,
                     room_execution_policy=room_execution_policy,
                 )
+            policy = body.get('_controller_loop_policy')
+            if policy is not None:
+                # Restrictive only; existing auth, scope and approvals apply.
+                from agent.controller_loop_guard import ControllerLoopGuard, verify_saved_artifact
+                from hermes_constants import get_hermes_home
+                with self._profile_scope(request_profile):
+                    profile_home = get_hermes_home().resolve()
+                if isinstance(policy, dict) and policy.get('saved_artifact'):
+                    verify_saved_artifact(policy['saved_artifact'], profile_home)
+                evidence_dir = (profile_home / 'artifacts/controller-evidence' / run_id).resolve()
+                if not evidence_dir.is_relative_to(profile_home):
+                    raise ValueError('controller evidence outside this profile')
+                agent._controller_loop_guard = ControllerLoopGuard(
+                    policy, evidence_dir,
+                    cancelled=lambda: bool(agent._interrupt_requested),
+                    profile_home=profile_home,
+                )
             self._active_run_agents[run_id] = agent
 
             def _approval_notify(approval_data: Dict[str, Any]) -> None:

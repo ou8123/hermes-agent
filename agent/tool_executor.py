@@ -620,6 +620,10 @@ def _run_agent_tool_execution_middleware(
             state["args"] = final_args
 
         def _begin() -> None:
+            # Start-order waits may observe cancellation after admission.
+            guard = getattr(agent, '_controller_loop_guard', None)
+            if guard is not None and guard.cancellation_fence():
+                return
             _begin_tool_execution(
                 agent,
                 function_name=function_name,
@@ -706,12 +710,43 @@ def _run_agent_tool_execution_middleware(
             )
             return result
 
+        loop_guard = getattr(agent, '_controller_loop_guard', None)
+        guard_ticket = None
+        if loop_guard is not None:
+            # Per-invocation identity; tool_call_id may be empty or repeated.
+            guard_ticket = loop_guard.new_ticket(tool_call_id)
+            resolver = None
+            if loop_guard.saved_artifact and function_name in {'write_file','edit_file','patch'}:
+                from tools.file_tools import _resolve_path_for_task
+                resolver = lambda path: _resolve_path_for_task(path, effective_task_id or 'default')
+            reason = loop_guard.admit(function_name, final_args, guard_ticket, resolve_path=resolver)
+            if reason:
+                _advance_start_order()
+                state['blocked'] = True
+                state['dispatched'] = False
+                result = loop_guard.blocked_payload(reason)
+                _emit_terminal_post_tool_call(
+                    agent, function_name=function_name, function_args=final_args,
+                    result=result, effective_task_id=effective_task_id,
+                    tool_call_id=tool_call_id, status='blocked',
+                    error_type='controller_loop_policy', error_message=reason,
+                    middleware_trace=list(state['middleware_trace']),
+                )
+                if loop_guard.stop_reason:
+                    agent.interrupt('Controller loop policy: '+loop_guard.stop_reason)
+                return result
+
         if function_name == "memory":
             agent._turns_since_memory = 0
         elif function_name == "skill_manage":
             agent._iters_since_skill = 0
 
-        _advance_start_order(_begin)
+        try:
+            _advance_start_order(_begin)
+        except BaseException:
+            if loop_guard is not None:
+                loop_guard.abandon(function_name, final_args, guard_ticket)
+            raise
 
         # Keep the gateway turn-inactivity watchdog from abandoning a turn
         # whose tool call runs silently for longer than the inactivity
@@ -729,8 +764,30 @@ def _run_agent_tool_execution_middleware(
         )
         _hb_thread.start()
         try:
-            return execute(final_args)
+            loop_guard = getattr(agent, '_controller_loop_guard', None)
+            if loop_guard is None:
+                return execute(final_args)
+            # Existing scope, plugin, approval and guardrail checks ran above.
+            result = loop_guard.execute_admitted(function_name, final_args, guard_ticket, execute)
+            if loop_guard.is_blocked(result):
+                state['blocked'] = True
+                state['dispatched'] = False
+                _emit_terminal_post_tool_call(
+                    agent, function_name=function_name, function_args=final_args,
+                    result=result, effective_task_id=effective_task_id,
+                    tool_call_id=tool_call_id, status='blocked',
+                    error_type='controller_loop_policy',
+                    error_message='Run-local controller policy blocked dispatch',
+                    middleware_trace=list(state['middleware_trace']),
+                )
+            if loop_guard.stop_reason:
+                agent.interrupt('Controller loop policy: '+loop_guard.stop_reason)
+            return result
         finally:
+            if loop_guard is not None:
+                loop_guard.abandon(function_name, final_args, guard_ticket)
+                if loop_guard.stop_reason:
+                    agent.interrupt('Controller loop policy: '+loop_guard.stop_reason)
             _hb_stop.set()
             _hb_thread.join(timeout=2.0)
 

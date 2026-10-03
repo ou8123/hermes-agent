@@ -2236,6 +2236,15 @@ def _check_binary_document_write(filepath: str, task_id: str = "default") -> str
     return None
 
 
+def _controller_effect_error(paths, task_id):
+    from agent.controller_loop_guard import current_effect_error, has_active_guard
+    if not has_active_guard():
+        return None
+    # Use the exact native task resolver; process cwd is not authoritative.
+    resolved = [str(_resolve_path_for_task(path, task_id)) for path in paths]
+    return current_effect_error(resolved)
+
+
 def write_file_tool(path: str, content: str, task_id: str = "default",
                     cross_profile: bool = False,
                     session_id: str | None = None) -> str:
@@ -2258,6 +2267,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     approval_err = _check_approval_required_write([path], task_id)
     if approval_err:
         return tool_error(approval_err)
+    controller_error = _controller_effect_error([path], task_id)
+    if controller_error:
+        return tool_error(controller_error)
     if not cross_profile:
         cross_warning = _check_cross_profile_path(path, task_id)
         if cross_warning:
@@ -2280,6 +2292,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         if _resolved is None:
             stale_warning = _check_file_staleness(path, task_id)
             file_ops = _get_file_ops(task_id)
+            controller_error = _controller_effect_error([path], task_id)
+            if controller_error:
+                return tool_error(controller_error)
             result = file_ops.write_file(path, content)
             result_dict = result.to_dict()
             if stale_warning:
@@ -2301,6 +2316,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             # terminal's cwd (the worktree-cwd bug). Lowest priority of the three.
             cwd_warning = _path_resolution_warning(path, Path(_resolved), task_id)
             file_ops = _get_file_ops(task_id)
+            controller_error = _controller_effect_error([_resolved], task_id)
+            if controller_error:
+                return tool_error(controller_error)
             result = file_ops.write_file(_resolved, content)
             result_dict = result.to_dict()
             effective_warning = cross_warning or stale_warning or cwd_warning
@@ -2408,6 +2426,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
     approval_err = _check_approval_required_write(_paths_to_check, task_id)
     if approval_err:
         return tool_error(approval_err)
+    controller_error = _controller_effect_error(_paths_to_check, task_id)
+    if controller_error:
+        return tool_error(controller_error)
     try:
         # Resolve paths for locking.  Ordered + deduplicated so concurrent
         # callers lock in the same order — prevents deadlock on overlapping
@@ -2464,6 +2485,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 # path would let the two layers disagree about which file is
                 # being edited.
                 _replace_target = _path_to_resolved.get(path) or path
+                controller_error = _controller_effect_error([_replace_target], task_id)
+                if controller_error:
+                    return tool_error(controller_error)
                 result = file_ops.patch_replace(_replace_target, old_string, new_string, replace_all)
             elif mode == "patch":
                 if not patch:
@@ -2476,6 +2500,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 patch_for_ops = _rewrite_v4a_patch_paths_for_host(
                     patch, _path_to_resolved, file_ops
                 )
+                controller_error = _controller_effect_error(_paths_to_check, task_id)
+                if controller_error:
+                    return tool_error(controller_error)
                 result = file_ops.patch_v4a(patch_for_ops)
             else:
                 return tool_error(f"Unknown mode: {mode}")

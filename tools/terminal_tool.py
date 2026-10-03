@@ -54,6 +54,16 @@ from utils import env_var_enabled
 logger = logging.getLogger(__name__)
 
 
+def _controller_effect_error():
+    # Only a controller-guarded invocation has this context; no new grants.
+    from agent.controller_loop_guard import current_effect_error
+    reason = current_effect_error()
+    if reason:
+        return json.dumps({'output': '', 'exit_code': 130 if reason == 'USER_CANCEL' else -1,
+                           'error': reason, 'status': 'cancelled' if reason == 'USER_CANCEL' else 'blocked'})
+    return None
+
+
 def _redact_terminal_error_text(value: Any) -> str:
     """Force-redact text before serializing a terminal error envelope."""
     from agent.redact import redact_sensitive_text
@@ -3279,6 +3289,10 @@ def terminal_tool(
                 desc = approval.get("description", "flagged as dangerous")
                 approval_note = f"Command was flagged ({desc}) and auto-approved by smart approval."
 
+        controller_error = _controller_effect_error()
+        if controller_error:
+            return controller_error
+
         # Prepare command for execution
         pty_disabled_reason = None
         effective_pty = pty
@@ -3305,6 +3319,9 @@ def terminal_tool(
                 env_type=env_type,
             )
             try:
+                controller_error = _controller_effect_error()
+                if controller_error:
+                    return controller_error
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
                         command=command,
@@ -3589,6 +3606,9 @@ def terminal_tool(
                         # reads, RPC reads) intentionally stay unbounded.
                         "bounded_capture": True,
                     }
+                    controller_error = _controller_effect_error()
+                    if controller_error:
+                        return controller_error
                     result = env.execute(command, **execute_kwargs)
                 except Exception as e:
                     error_str = str(e).lower()
